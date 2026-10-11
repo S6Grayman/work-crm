@@ -1,0 +1,7 @@
+*.db
+*.db-journal
+__pycache__/
+.pytest_cache/
+.kitchen-crm/
+*.pyc
+.venv/
