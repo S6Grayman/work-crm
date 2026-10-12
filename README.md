@@ -34,14 +34,14 @@ Binds to **localhost only**. It is not a public website.
 
 ## How to use it
 
-1. Create a **project** (and who it's for). Put it in Planning, Execution, or Launch.
-2. Keep **Current status** as one paragraph you'd send today.
-3. After every call, email, decision, or step, **log it**.
-4. Open **Status report** → Print / PDF. That's the pack you share.
+1. Create a **client profile** (Clients in the sidebar).
+2. Create a **project** and pick that client.
+3. Keep **Current status** as one paragraph you'd send today.
+4. After every call, email, decision, or step, **log it**.
+5. Drop **PDFs and pictures** on the project (Attachments). They stay next to the database on this computer.
+6. Open **Status report** → Print / PDF.
 
-The home screen is a grouped table (status/priority chips). The written status and the log still live on the project page.
-
-**Developer mode** (sidebar → Developer): turn it on to add board columns (e.g. Assigned between Client and Status), reorder, or remove custom columns. Built-in columns stay. This is local-only; there is no cloud admin login.
+The home screen is a grouped table. Click ▾ on a column to rename it, add a column left or right, or filter like a spreadsheet. Each section has its own filter bar.
 
 Log types: Call, Email, Meeting, Decision, Process step, Blocker, Note.
 
@@ -63,4 +63,4 @@ MIT
 
 ## Parked
 
-Working, tests green. Resume here: grouped board + status report + developer-mode custom columns. Not on GitHub yet. Next if we pick it up: more column types, or publish the repo.
+Working. Resume: grouped board, column menus, per-section filters, client profiles (sidebar → Clients) linked on new projects. Private GitHub first snapshot only — do not push unless Earl asks. Guest `~/labs/linux-growth/work-crm`, host `J:\hermes-exfil\linux-growth\work-crm`. GitHub replay PDF: `J:\hermes-exfil\GitHub-repo-setup-guide.pdf`.

@@ -66,15 +66,65 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(board["Execution"][0]["health"], "stuck")
         self.assertEqual(list(board), ["Planning", "Execution", "Launch"])
 
-    def test_dev_column_inserts_after_client(self) -> None:
+    def test_column_insert_and_rename(self) -> None:
         pid = self.store.add_project("Family laptop", client="Ada")
         col_id = self.store.add_column("Assigned", after="client")
         keys = [c["key"] for c in self.store.list_columns()]
         self.assertEqual(keys[:4], ["name", "client", "assigned", "health"])
         self.store.set_cell(pid, col_id, "Jordan")
         self.assertEqual(self.store.cell_value(pid, col_id), "Jordan")
-        self.store.set_dev_mode(True)
-        self.assertTrue(self.store.dev_mode())
+        self.store.rename_column(col_id, "Owner")
+        labels = [c["label"] for c in self.store.list_columns()]
+        self.assertIn("Owner", labels)
+        self.store.insert_column("Shop", beside="client", side="left")
+        keys = [c["key"] for c in self.store.list_columns()]
+        self.assertEqual(keys[:4], ["name", "shop", "client", "assigned"])
+
+    def test_project_matches_column_filter(self) -> None:
+        stuck = self.store.add_project("A", client="Ada", health="stuck")
+        self.store.add_project("B", client="Bob", health="working")
+        a = self.store.get_project(stuck)
+        self.assertTrue(self.store.matches(a, {"health": "stuck"}))
+        self.assertFalse(self.store.matches(a, {"health": "working"}))
+        self.assertTrue(self.store.matches(a, {"client": "Ada"}))
+
+    def test_client_profile_required_and_linked_to_project(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.add_client("  ")
+        cid = self.store.add_client(
+            "Ada Household",
+            contact_name="Ada",
+            phone="555-0100",
+            email="ada@example.com",
+            city="Martinsville",
+        )
+        client = self.store.get_client(cid)
+        self.assertEqual(client["name"], "Ada Household")
+        self.assertEqual(client["contact_name"], "Ada")
+        pid = self.store.add_project("Mint install", client_id=cid)
+        job = self.store.get_project(pid)
+        self.assertEqual(job["client_id"], cid)
+        self.assertEqual(job["client"], "Ada Household")
+        linked = self.store.projects_for_client(cid)
+        self.assertEqual(len(linked), 1)
+        self.assertEqual(linked[0]["id"], pid)
+
+    def test_project_attachments_round_trip(self) -> None:
+        pid = self.store.add_project("Family laptop")
+        aid = self.store.add_attachment(pid, "quote.pdf", b"%PDF-fake", "application/pdf")
+        rows = self.store.list_attachments(pid)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "quote.pdf")
+        data, mime, name = self.store.read_attachment(pid, aid)
+        self.assertEqual(data, b"%PDF-fake")
+        self.assertEqual(name, "quote.pdf")
+        self.assertIn("pdf", mime)
+        self.store.delete_attachment(pid, aid)
+        self.assertEqual(self.store.list_attachments(pid), [])
+        with self.assertRaises(ValueError):
+            self.store.add_attachment(pid, "evil.exe", b"MZ", "application/octet-stream")
+        with self.assertRaises(ValueError):
+            self.store.add_attachment(999, "x.pdf", b"x", "application/pdf")
 
 
 if __name__ == "__main__":
