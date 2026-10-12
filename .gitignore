@@ -6,3 +6,6 @@ __pycache__/
 .kitchen-crm/
 *.pyc
 .venv/
+dist/
+build/
+*.spec

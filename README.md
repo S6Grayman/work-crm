@@ -4,9 +4,26 @@ A tiny **local** project notebook: current status + the log that proves it.
 
 Not a sales CRM. You write a status someone else can read, then keep a dated record of calls, emails, decisions, process steps, and blockers. The **status report** is those two things together.
 
-No cloud. No account. One SQLite file. Runs on **Windows and Linux** with Python 3.11+ — no pip, no Docker. Hand someone this folder; they run it.
+No cloud. No account. One SQLite file. Runs on **Windows and Linux**. Hand someone this folder.
 
-## Run
+## For someone who doesn't use GitHub or a terminal
+
+This is **not a website**. They download a program, run it on their PC, and work stays on **their** machine.
+
+**Windows (recommended):** GitHub Actions builds `WorkCRM.exe`. After a version tag (`v0.1.0`), the download lives on the **Releases** page. They double-click the exe, a browser opens, they leave the window open to keep it running. Close the window to stop.
+
+Until this repo is **Public**, only people you invite can open that download link. Private repo = not a public “anyone with the link” store.
+
+**Fallback (needs Python):** zip this folder. Windows: `Start-WorkCRM.bat`. Linux: `start-workcrm.sh`.
+
+| OS | Where work is saved |
+|---|---|
+| Linux | `~/.work-crm/work.db` (attachments in `files/` next to the db) |
+| Windows | `%APPDATA%\WorkCRM\work.db` |
+
+Do not ship `*.db` or a `files/` folder that has customer data.
+
+## Run (terminal)
 
 ```bash
 python3 crm.py

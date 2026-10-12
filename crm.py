@@ -10,6 +10,7 @@ import re
 import sqlite3
 import sys
 import threading
+import webbrowser
 from datetime import datetime, timezone
 from email import message_from_bytes
 from email.policy import HTTP as EMAIL_HTTP
@@ -1637,12 +1638,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", default=str(default_db_path()))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        default=bool(getattr(sys, "frozen", False)),
+        help="Open the app in a browser (default when running as WorkCRM.exe)",
+    )
     args = parser.parse_args(argv)
 
     store = Store(args.db)
     handler = make_handler(store)
     httpd = HTTPServer((args.host, args.port), handler)
-    print(f"WorkCRM  http://{args.host}:{args.port}  db={args.db}", flush=True)
+    url = f"http://{args.host}:{args.port}"
+    print(f"WorkCRM  {url}  db={args.db}", flush=True)
+    if args.open:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
