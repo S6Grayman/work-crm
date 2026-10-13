@@ -54,7 +54,7 @@ BUILTIN_COLUMNS = (
 )
 MAX_TEXT_LENGTH = 5000
 MAX_NAME_LENGTH = 250
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def slugify(label: str) -> str:
@@ -295,6 +295,13 @@ class Store:
                 if name not in cols:
                     self.conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {decl}")
 
+        if current_version < 3:
+            cols = {row[1] for row in self.conn.execute("PRAGMA table_info(entries)")}
+            if "resolved" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE entries ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0"
+                )
+
         existing = self.conn.execute(
             "SELECT COUNT(*) FROM board_columns"
         ).fetchone()[0]
@@ -340,6 +347,12 @@ class Store:
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def delete_project(self, project_id: int) -> None:
+        if self.get_project(project_id) is None:
+            raise ValueError("Project not found")
+        self.conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        self.conn.commit()
 
     def files_root(self) -> Path:
         return Path(self.db_path).resolve().parent / "files"
@@ -751,8 +764,8 @@ class Store:
         when = normalize_iso_datetime(happened_at or utcnow())
         now = utcnow()
         cur = self.conn.execute(
-            """INSERT INTO entries (project_id, kind, who, body, happened_at, created_at)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO entries (project_id, kind, who, body, happened_at, created_at, resolved)
+               VALUES (?,?,?,?,?,?,0)""",
             (project_id, kind, who.strip(), body, when, now),
         )
         self.conn.execute(
@@ -760,6 +773,25 @@ class Store:
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def resolve_blocker(self, project_id: int, entry_id: int) -> None:
+        row = self.conn.execute(
+            "SELECT id, kind, project_id FROM entries WHERE id=? AND project_id=?",
+            (entry_id, project_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Blocker not found")
+        if row["kind"] != "blocker":
+            raise ValueError("Only blocker entries can be resolved")
+        self.conn.execute(
+            "UPDATE entries SET resolved=1 WHERE id=? AND project_id=?",
+            (entry_id, project_id),
+        )
+        self.conn.execute(
+            "UPDATE projects SET updated_at=? WHERE id=?",
+            (utcnow(), project_id),
+        )
+        self.conn.commit()
 
     def list_entries(self, project_id: int, since: str | None = None) -> list[sqlite3.Row]:
         if since:
@@ -784,7 +816,7 @@ class Store:
         return list(
             self.conn.execute(
                 """SELECT * FROM entries
-                   WHERE project_id=? AND kind='blocker'
+                   WHERE project_id=? AND kind='blocker' AND resolved=0
                    ORDER BY happened_at DESC, id DESC""",
                 (project_id,),
             )
@@ -1205,6 +1237,14 @@ class Handler(BaseHTTPRequestHandler):
                     client_id=cid,
                 )
                 self._redirect(f"/projects/{pid}")
+            elif path.startswith("/projects/") and path.endswith("/delete"):
+                pid = int(path.split("/")[2])
+                self.store.delete_project(pid)
+                self._redirect("/")
+            elif path.startswith("/projects/") and "/blockers/" in path and path.endswith("/resolve"):
+                bits = path.split("/")
+                self.store.resolve_blocker(int(bits[2]), int(bits[4]))
+                self._redirect(f"/projects/{bits[2]}")
             elif path.startswith("/projects/") and path.endswith("/health"):
                 pid = int(path.split("/")[2])
                 self.store.set_health(pid, form.get("health", ""))
@@ -1559,11 +1599,19 @@ class Handler(BaseHTTPRequestHandler):
         extra = (
             f'<a class="btn ghost" href="/projects/{project_id}/edit">Edit</a>'
             f'<a class="btn" href="/projects/{project_id}/report">Status report</a>'
+            f'<form method="post" action="/projects/{project_id}/delete" style="display:inline">'
+            f'<button class="btn ghost" type="submit">Delete project</button></form>'
         )
         block_html = ""
         if blockers:
-            items = "".join(f"<li>{e(b['body'])}</li>" for b in blockers)
-            block_html = f'<div class="box" style="margin-bottom:16px"><h2>Open blockers</h2><ul>{items}</ul></div>'
+            items = []
+            for b in blockers:
+                items.append(
+                    f'<li>{e(b["body"])} '
+                    f'<form method="post" action="/projects/{project_id}/blockers/{b["id"]}/resolve" style="display:inline">'
+                    f'<button class="btn ghost" type="submit">Resolve</button></form></li>'
+                )
+            block_html = f'<div class="box" style="margin-bottom:16px"><h2>Open blockers</h2><ul>{"".join(items)}</ul></div>'
         timeline = self._timeline(entries)
         status_when = short_when(p["status_at"]) or "not set"
         items = []
