@@ -52,11 +52,65 @@ BUILTIN_COLUMNS = (
     ("last_log", "Last log", "last_log"),
     ("log_count", "Log", "log_count"),
 )
+MAX_TEXT_LENGTH = 5000
+MAX_NAME_LENGTH = 250
+SCHEMA_VERSION = 2
 
 
 def slugify(label: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
     return (s[:40] or "column")
+
+
+def clean_required_text(value: Any, field_name: str, *, max_length: int = MAX_TEXT_LENGTH) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    if len(text) > max_length:
+        raise ValueError(f"{field_name} is too long")
+    return text
+
+
+def normalize_iso_datetime(raw: str | None) -> str:
+    if raw is None:
+        return utcnow()
+    value = str(raw).strip()
+    if not value:
+        return utcnow()
+    normalized = value.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date/time: {raw}") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def sanitize_attachment_name(filename: str) -> str:
+    raw_name = str(filename or "").replace("\\", "/")
+    name = Path(raw_name).name.strip()
+    if not name or name in (".", ".."):
+        raise ValueError("File name is required")
+    if name.startswith("."):
+        raise ValueError("Hidden files are not allowed")
+    if len(name) > 200:
+        raise ValueError("File name is too long")
+    if any(ch in name for ch in ("/", "\\", "\x00")):
+        raise ValueError("Invalid file name")
+    return name
+
+
+def normalize_attachment_mime(mime: str, ext: str) -> str:
+    allowed = set(ATTACH_TYPES.values())
+    if mime:
+        normalized = str(mime).lower().split(";")[0].strip()
+        if normalized in {"image/pjpeg"}:
+            normalized = "image/jpeg"
+        if normalized not in allowed:
+            raise ValueError("Unsupported file type")
+        return normalized
+    return ATTACH_TYPES[ext]
 
 
 CLIENT_FIELDS = (
@@ -121,96 +175,129 @@ class Store:
         with self._lock:
             self.conn.close()
 
+    def _current_schema_version(self) -> int:
+        row = self.conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def _set_schema_version(self, version: int) -> None:
+        self.conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(version),),
+        )
+        self.conn.commit()
+
     def _migrate(self) -> None:
         self.conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS projects (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                client TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT '',
-                status_at TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                kind TEXT NOT NULL,
-                who TEXT NOT NULL DEFAULT '',
-                body TEXT NOT NULL,
-                happened_at TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            """
-        )
-        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(projects)")}
-        extras = {
-            "lane": "TEXT NOT NULL DEFAULT 'Planning'",
-            "health": "TEXT NOT NULL DEFAULT 'not_started'",
-            "priority": "TEXT NOT NULL DEFAULT 'medium'",
-            "client_id": "INTEGER",
-        }
-        for name, decl in extras.items():
-            if name not in cols:
-                self.conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {decl}")
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
+            CREATE TABLE IF NOT EXISTS schema_meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
-            CREATE TABLE IF NOT EXISTS board_columns (
-                id INTEGER PRIMARY KEY,
-                key TEXT NOT NULL UNIQUE,
-                label TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                position INTEGER NOT NULL,
-                builtin INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS column_values (
-                column_id INTEGER NOT NULL REFERENCES board_columns(id) ON DELETE CASCADE,
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                value TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (column_id, project_id)
-            );
-            CREATE TABLE IF NOT EXISTS clients (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                short_name TEXT NOT NULL DEFAULT '',
-                industry TEXT NOT NULL DEFAULT '',
-                website TEXT NOT NULL DEFAULT '',
-                street TEXT NOT NULL DEFAULT '',
-                city TEXT NOT NULL DEFAULT '',
-                region TEXT NOT NULL DEFAULT '',
-                postal TEXT NOT NULL DEFAULT '',
-                country TEXT NOT NULL DEFAULT '',
-                phone TEXT NOT NULL DEFAULT '',
-                email TEXT NOT NULL DEFAULT '',
-                billing_email TEXT NOT NULL DEFAULT '',
-                contact_name TEXT NOT NULL DEFAULT '',
-                contact_title TEXT NOT NULL DEFAULT '',
-                contact_phone TEXT NOT NULL DEFAULT '',
-                contact_email TEXT NOT NULL DEFAULT '',
-                preferred_contact TEXT NOT NULL DEFAULT '',
-                timezone TEXT NOT NULL DEFAULT '',
-                account_ref TEXT NOT NULL DEFAULT '',
-                notes TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS attachments (
-                id INTEGER PRIMARY KEY,
-                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                stored TEXT NOT NULL,
-                mime TEXT NOT NULL DEFAULT '',
-                size INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            );
             """
         )
-        existing = self.conn.execute("SELECT COUNT(*) FROM board_columns").fetchone()[0]
+        current_version = self._current_schema_version()
+        if current_version < 1:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS projects (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    client TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    status_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS entries (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL,
+                    who TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL,
+                    happened_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+        if current_version < 2:
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS board_columns (
+                    id INTEGER PRIMARY KEY,
+                    key TEXT NOT NULL UNIQUE,
+                    label TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    builtin INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS column_values (
+                    column_id INTEGER NOT NULL REFERENCES board_columns(id) ON DELETE CASCADE,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    value TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (column_id, project_id)
+                );
+                CREATE TABLE IF NOT EXISTS clients (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    short_name TEXT NOT NULL DEFAULT '',
+                    industry TEXT NOT NULL DEFAULT '',
+                    website TEXT NOT NULL DEFAULT '',
+                    street TEXT NOT NULL DEFAULT '',
+                    city TEXT NOT NULL DEFAULT '',
+                    region TEXT NOT NULL DEFAULT '',
+                    postal TEXT NOT NULL DEFAULT '',
+                    country TEXT NOT NULL DEFAULT '',
+                    phone TEXT NOT NULL DEFAULT '',
+                    email TEXT NOT NULL DEFAULT '',
+                    billing_email TEXT NOT NULL DEFAULT '',
+                    contact_name TEXT NOT NULL DEFAULT '',
+                    contact_title TEXT NOT NULL DEFAULT '',
+                    contact_phone TEXT NOT NULL DEFAULT '',
+                    contact_email TEXT NOT NULL DEFAULT '',
+                    preferred_contact TEXT NOT NULL DEFAULT '',
+                    timezone TEXT NOT NULL DEFAULT '',
+                    account_ref TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    stored TEXT NOT NULL,
+                    mime TEXT NOT NULL DEFAULT '',
+                    size INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            cols = {row[1] for row in self.conn.execute("PRAGMA table_info(projects)")}
+            extras = {
+                "lane": "TEXT NOT NULL DEFAULT 'Planning'",
+                "health": "TEXT NOT NULL DEFAULT 'not_started'",
+                "priority": "TEXT NOT NULL DEFAULT 'medium'",
+                "client_id": "INTEGER",
+            }
+            for name, decl in extras.items():
+                if name not in cols:
+                    self.conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {decl}")
+
+        existing = self.conn.execute(
+            "SELECT COUNT(*) FROM board_columns"
+        ).fetchone()[0]
         if existing == 0:
             for pos, (key, label, kind) in enumerate(BUILTIN_COLUMNS):
                 self.conn.execute(
@@ -218,6 +305,8 @@ class Store:
                        VALUES (?,?,?,?,1)""",
                     (key, label, kind, pos),
                 )
+
+        self._set_schema_version(SCHEMA_VERSION)
         self.conn.commit()
 
     def add_project(
@@ -229,15 +318,13 @@ class Store:
         priority: str = "medium",
         client_id: int | None = None,
     ) -> int:
-        name = name.strip()
-        if not name:
-            raise ValueError("Project name is required")
+        name = clean_required_text(name, "Project name", max_length=MAX_NAME_LENGTH)
         lane = (lane or "Planning").strip() or "Planning"
         if health not in HEALTH:
             health = "not_started"
         if priority not in PRIORITY:
             priority = "medium"
-        label = client.strip()
+        label = str(client or "").strip()
         cid: int | None = None
         if client_id:
             profile = self.get_client(int(client_id))
@@ -262,9 +349,7 @@ class Store:
     ) -> int:
         if self.get_project(project_id) is None:
             raise ValueError("Project not found")
-        raw_name = Path(filename.replace("\\", "/")).name.strip()
-        if not raw_name or raw_name in (".", ".."):
-            raise ValueError("File name is required")
+        raw_name = sanitize_attachment_name(filename)
         ext = Path(raw_name).suffix.lower()
         if ext not in ATTACH_TYPES:
             raise ValueError("Allowed: PDF, PNG, JPG, GIF, WebP, TXT, CSV")
@@ -272,12 +357,12 @@ class Store:
             raise ValueError("Empty file")
         if len(data) > ATTACH_MAX:
             raise ValueError("File is too large (12 MB max)")
-        mime = (mime or ATTACH_TYPES[ext]).split(";")[0].strip() or ATTACH_TYPES[ext]
+        normalized_mime = normalize_attachment_mime(mime, ext)
         now = utcnow()
         cur = self.conn.execute(
             """INSERT INTO attachments (project_id, name, stored, mime, size, created_at)
                VALUES (?,?,?,?,?,?)""",
-            (project_id, raw_name, "", mime, len(data), now),
+            (project_id, raw_name, "", normalized_mime, len(data), now),
         )
         aid = int(cur.lastrowid)
         stored = f"{project_id}/{aid}{ext}"
@@ -325,9 +410,7 @@ class Store:
             path.unlink()
 
     def add_client(self, name: str, **fields: str) -> int:
-        name = name.strip()
-        if not name:
-            raise ValueError("Company name is required")
+        name = clean_required_text(name, "Company name", max_length=MAX_NAME_LENGTH)
         now = utcnow()
         keys = ["name", "created_at", "updated_at"]
         vals: list[Any] = [name, now, now]
@@ -360,9 +443,7 @@ class Store:
     def update_client(self, client_id: int, name: str, **fields: str) -> None:
         if self.get_client(client_id) is None:
             raise ValueError("Client not found")
-        name = name.strip()
-        if not name:
-            raise ValueError("Company name is required")
+        name = clean_required_text(name, "Company name", max_length=MAX_NAME_LENGTH)
         allowed = {k for k, _ in CLIENT_FIELDS if k != "name"}
         sets = ["name=?", "updated_at=?"]
         vals: list[Any] = [name, utcnow()]
@@ -411,9 +492,7 @@ class Store:
         priority: str | None = None,
         client_id: int | None = None,
     ) -> None:
-        name = name.strip()
-        if not name:
-            raise ValueError("Project name is required")
+        name = clean_required_text(name, "Project name", max_length=MAX_NAME_LENGTH)
         row = self.get_project(project_id)
         if row is None:
             raise ValueError("Project not found")
@@ -492,9 +571,7 @@ class Store:
         )
 
     def add_column(self, label: str, after: str = "") -> int:
-        label = label.strip()
-        if not label:
-            raise ValueError("Column name is required")
+        label = clean_required_text(label, "Column name", max_length=100)
         key = slugify(label)
         taken = {
             row["key"] for row in self.conn.execute("SELECT key FROM board_columns")
@@ -534,9 +611,7 @@ class Store:
         return self.add_column(label)
 
     def rename_column(self, column_id: int, label: str) -> None:
-        label = label.strip()
-        if not label:
-            raise ValueError("Column name is required")
+        label = clean_required_text(label, "Column name", max_length=100)
         row = self.conn.execute(
             "SELECT id FROM board_columns WHERE id=?", (column_id,)
         ).fetchone()
@@ -652,10 +727,11 @@ class Store:
     def set_status(self, project_id: int, status: str) -> None:
         if self.get_project(project_id) is None:
             raise ValueError("Project not found")
+        status = clean_required_text(status, "Status", max_length=MAX_TEXT_LENGTH)
         now = utcnow()
         self.conn.execute(
             "UPDATE projects SET status=?, status_at=?, updated_at=? WHERE id=?",
-            (status.strip(), now, now, project_id),
+            (status, now, now, project_id),
         )
         self.conn.commit()
 
@@ -671,10 +747,8 @@ class Store:
             raise ValueError("Project not found")
         if kind not in KINDS:
             raise ValueError("Unknown entry type")
-        body = body.strip()
-        if not body:
-            raise ValueError("Entry text is required")
-        when = (happened_at or utcnow()).strip()
+        body = clean_required_text(body, "Entry text", max_length=MAX_TEXT_LENGTH)
+        when = normalize_iso_datetime(happened_at or utcnow())
         now = utcnow()
         cur = self.conn.execute(
             """INSERT INTO entries (project_id, kind, who, body, happened_at, created_at)
@@ -694,7 +768,7 @@ class Store:
                     """SELECT * FROM entries
                        WHERE project_id=? AND happened_at >= ?
                        ORDER BY happened_at DESC, id DESC""",
-                    (project_id, since),
+                    (project_id, normalize_iso_datetime(since)),
                 )
             )
         return list(
@@ -903,6 +977,7 @@ th { color:var(--muted); font-size:11px; font-weight:600; letter-spacing:.04em; 
   a { color:#111; }
 }
 """
+
 
 def page(title: str, body: str, nav: str = "projects") -> bytes:
     def item(href: str, key: str, label: str) -> str:
@@ -1222,7 +1297,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def chip(action: str, field: str, value: str, mapping: dict[str, str], pid: int) -> str:
             return (
-                f'<td class="chip-cell"><form method="post" action="/projects/{pid}/{action}">'
+                f'<td class="chip-cell"><form method="post" action="/projects/{pid}/{action}">' 
                 f'<select class="{e(value)}" name="{field}" onchange="this.form.submit()">'
                 f"{map_options(mapping, value)}</select></form></td>"
             )
@@ -1391,7 +1466,7 @@ class Handler(BaseHTTPRequestHandler):
             val = c[key] if c else ""
             if key == "notes":
                 bits.append(f'<label>{e(label)} <textarea name="{key}">{e(val)}</textarea></label>')
-            elif key == "email" or key == "billing_email" or key == "contact_email":
+            elif key in {"email", "billing_email", "contact_email"}:
                 bits.append(
                     f'<label>{e(label)} <input name="{key}" type="email" value="{e(val)}"></label>'
                 )
