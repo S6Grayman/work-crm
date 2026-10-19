@@ -80,4 +80,6 @@ MIT
 
 ## Parked
 
-Working. Resume: grouped board, column menus, per-section filters, client profiles (sidebar → Clients) linked on new projects. Private GitHub first snapshot only — do not push unless Earl asks. Guest `~/labs/linux-growth/work-crm`, host `J:\hermes-exfil\linux-growth\work-crm`. GitHub replay PDF: `J:\hermes-exfil\GitHub-repo-setup-guide.pdf`.
+Working. Resume: board + column menus + filters, Clients, attachments, Slack/Monday-inspired look. Private GitHub `S6Grayman/work-crm` (updates pushed). Windows `WorkCRM.exe` via Actions + version tag → Releases; send the **file** (Drive/email), not a GitHub link. Keep repo Private unless Earl says otherwise. Guest `~/labs/linux-growth/work-crm`, host `J:\hermes-exfil\linux-growth\work-crm`.
+
+Guides on J:\ `GitHub-repo-setup-guide.pdf`, `GitHub-push-updates-guide.pdf`, `WorkCRM-Windows-exe-guide.pdf`, `How-to-use-WorkCRM.pdf` (for the Windows user).

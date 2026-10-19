@@ -126,6 +126,49 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.add_attachment(999, "x.pdf", b"x", "application/pdf")
 
+    def test_archive_hides_from_board(self) -> None:
+        live = self.store.add_project("Live USB", lane="Planning")
+        done = self.store.add_project("Old job", lane="Launch", health="done")
+        self.store.set_archived(done, True)
+        board = self.store.board()
+        names = [p["name"] for lane in board.values() for p in lane]
+        self.assertIn("Live USB", names)
+        self.assertNotIn("Old job", names)
+        archived = self.store.list_archived()
+        self.assertEqual([p["name"] for p in archived], ["Old job"])
+        self.store.set_archived(done, False)
+        names = [p["name"] for lane in self.store.board().values() for p in lane]
+        self.assertIn("Old job", names)
+        self.assertEqual(self.store.list_archived(), [])
+        self.assertEqual(self.store.get_project(live)["archived"], 0)
+
+    def test_merge_import_keeps_local_work(self) -> None:
+        self.store.set_profile("ada@example.com", "Ada")
+        self.store.add_project("Ada job")
+        pkg = self.store.export_package()
+        other_db = Path(self.tmp.name) / "other.db"
+        other = Store(other_db)
+        other.set_profile("bob@example.com", "Bob")
+        other.add_project("Bob only")
+        summary = other.import_package(pkg)
+        names = {p["name"] for lane in other.board().values() for p in lane}
+        self.assertIn("Bob only", names)
+        self.assertIn("Ada job", names)
+        ada = next(p for p in other.list_projects() if p["name"] == "Ada job")
+        self.assertEqual(ada["created_by"], "ada@example.com")
+        self.assertEqual(ada["last_edited_by"], "ada@example.com")
+        self.assertGreaterEqual(summary["added"], 1)
+        other.close()
+
+    def test_export_writes_to_chosen_folder(self) -> None:
+        self.store.set_profile("ada@example.com", "Ada")
+        dest = Path(self.tmp.name) / "exports"
+        self.store.set_setting("export_dir", str(dest))
+        path = self.store.write_export()
+        self.assertTrue(path.is_file())
+        self.assertEqual(path.parent, dest.resolve())
+        self.assertTrue(path.name.endswith(".workcrm"))
+
 
 if __name__ == "__main__":
     unittest.main()

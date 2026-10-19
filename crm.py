@@ -5,12 +5,18 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
+import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
+import uuid
 import webbrowser
+import zipfile
 from datetime import datetime, timezone
 from email import message_from_bytes
 from email.policy import HTTP as EMAIL_HTTP
@@ -54,12 +60,32 @@ BUILTIN_COLUMNS = (
 )
 MAX_TEXT_LENGTH = 5000
 MAX_NAME_LENGTH = 250
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 def slugify(label: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
     return (s[:40] or "column")
+
+
+def default_export_dir() -> Path:
+    desk = Path.home() / "Desktop"
+    if desk.is_dir():
+        return desk
+    return Path.home() / "WorkCRM-exports"
+
+
+def new_uid() -> str:
+    return str(uuid.uuid4())
+
+
+def normalize_email(raw: str) -> str:
+    email = str(raw or "").strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise ValueError("A real email address is required")
+    if len(email) > 200:
+        raise ValueError("Email is too long")
+    return email
 
 
 def clean_required_text(value: Any, field_name: str, *, max_length: int = MAX_TEXT_LENGTH) -> str:
@@ -302,6 +328,60 @@ class Store:
                     "ALTER TABLE entries ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0"
                 )
 
+        if current_version < 4:
+            cols = {row[1] for row in self.conn.execute("PRAGMA table_info(projects)")}
+            if "archived" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+                )
+
+        if current_version < 5:
+            self.conn.execute(
+                """CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+                    project_uid TEXT NOT NULL DEFAULT '',
+                    who TEXT NOT NULL DEFAULT '',
+                    action TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            for table, extras in (
+                (
+                    "projects",
+                    {
+                        "uid": "TEXT NOT NULL DEFAULT ''",
+                        "created_by": "TEXT NOT NULL DEFAULT ''",
+                        "last_edited_by": "TEXT NOT NULL DEFAULT ''",
+                    },
+                ),
+                (
+                    "clients",
+                    {
+                        "uid": "TEXT NOT NULL DEFAULT ''",
+                        "created_by": "TEXT NOT NULL DEFAULT ''",
+                        "last_edited_by": "TEXT NOT NULL DEFAULT ''",
+                    },
+                ),
+                ("entries", {"uid": "TEXT NOT NULL DEFAULT ''"}),
+                ("attachments", {"uid": "TEXT NOT NULL DEFAULT ''"}),
+            ):
+                have = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+                if not have:
+                    continue
+                for col, decl in extras.items():
+                    if col not in have:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            for table in ("projects", "clients", "entries", "attachments"):
+                have = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+                if "uid" not in have:
+                    continue
+                for row in self.conn.execute(f"SELECT id FROM {table} WHERE uid='' OR uid IS NULL"):
+                    self.conn.execute(
+                        f"UPDATE {table} SET uid=? WHERE id=?", (new_uid(), row["id"])
+                    )
+
         existing = self.conn.execute(
             "SELECT COUNT(*) FROM board_columns"
         ).fetchone()[0]
@@ -340,19 +420,97 @@ class Store:
             cid = int(profile["id"])
             label = profile["name"]
         now = utcnow()
+        who = self.get_setting("user_email")
         cur = self.conn.execute(
-            """INSERT INTO projects (name, client, client_id, status, status_at, lane, health, priority, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (name, label, cid, "", "", lane, health, priority, now, now),
+            """INSERT INTO projects (name, client, client_id, status, status_at, lane, health, priority,
+                   created_at, updated_at, uid, created_by, last_edited_by)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (name, label, cid, "", "", lane, health, priority, now, now, new_uid(), who, who),
         )
+        pid = int(cur.lastrowid)
         self.conn.commit()
-        return int(cur.lastrowid)
+        self.add_audit(pid, "created", f"Project “{name}”")
+        return pid
 
     def delete_project(self, project_id: int) -> None:
         if self.get_project(project_id) is None:
             raise ValueError("Project not found")
         self.conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
         self.conn.commit()
+
+    def set_archived(self, project_id: int, archived: bool) -> None:
+        if self.get_project(project_id) is None:
+            raise ValueError("Project not found")
+        self.conn.execute(
+            "UPDATE projects SET archived=?, updated_at=? WHERE id=?",
+            (1 if archived else 0, utcnow(), project_id),
+        )
+        self.conn.commit()
+
+    def list_archived(self) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """SELECT projects.*,
+                          (SELECT COUNT(*) FROM entries WHERE project_id = projects.id) AS entry_count
+                   FROM projects
+                   WHERE IFNULL(archived, 0)=1
+                   ORDER BY updated_at DESC"""
+            )
+        )
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        row = self.conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def profile(self) -> dict[str, str]:
+        return {
+            "email": self.get_setting("user_email"),
+            "name": self.get_setting("user_name"),
+        }
+
+    def set_profile(self, email: str, name: str) -> None:
+        email = normalize_email(email)
+        name = clean_required_text(name, "Your name", max_length=MAX_NAME_LENGTH)
+        self.set_setting("user_email", email)
+        self.set_setting("user_name", name)
+
+    def require_profile(self) -> str:
+        email = self.get_setting("user_email")
+        if not email:
+            raise ValueError("Set your profile (name and email) first")
+        return email
+
+    def add_audit(self, project_id: int | None, action: str, detail: str = "", who: str = "") -> None:
+        email = who or self.get_setting("user_email")
+        puid = ""
+        if project_id:
+            row = self.get_project(project_id)
+            if row is not None and "uid" in row.keys():
+                puid = row["uid"] or ""
+        self.conn.execute(
+            """INSERT INTO audit_log (project_id, project_uid, who, action, detail, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (project_id, puid, email, action, detail, utcnow()),
+        )
+        self.conn.commit()
+
+    def list_audit(self, project_id: int) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """SELECT * FROM audit_log
+                   WHERE project_id=? OR project_uid=(SELECT uid FROM projects WHERE id=?)
+                   ORDER BY id DESC LIMIT 80""",
+                (project_id, project_id),
+            )
+        )
 
     def files_root(self) -> Path:
         return Path(self.db_path).resolve().parent / "files"
@@ -373,9 +531,9 @@ class Store:
         normalized_mime = normalize_attachment_mime(mime, ext)
         now = utcnow()
         cur = self.conn.execute(
-            """INSERT INTO attachments (project_id, name, stored, mime, size, created_at)
-               VALUES (?,?,?,?,?,?)""",
-            (project_id, raw_name, "", normalized_mime, len(data), now),
+            """INSERT INTO attachments (project_id, name, stored, mime, size, created_at, uid)
+               VALUES (?,?,?,?,?,?,?)""",
+            (project_id, raw_name, "", normalized_mime, len(data), now, new_uid()),
         )
         aid = int(cur.lastrowid)
         stored = f"{project_id}/{aid}{ext}"
@@ -425,8 +583,9 @@ class Store:
     def add_client(self, name: str, **fields: str) -> int:
         name = clean_required_text(name, "Company name", max_length=MAX_NAME_LENGTH)
         now = utcnow()
-        keys = ["name", "created_at", "updated_at"]
-        vals: list[Any] = [name, now, now]
+        who = self.get_setting("user_email")
+        keys = ["name", "created_at", "updated_at", "uid", "created_by", "last_edited_by"]
+        vals: list[Any] = [name, now, now, new_uid(), who, who]
         allowed = {k for k, _ in CLIENT_FIELDS if k != "name"}
         for key, value in fields.items():
             if key not in allowed:
@@ -491,6 +650,7 @@ class Store:
                           (SELECT COUNT(*) FROM entries WHERE project_id = projects.id AND kind='blocker') AS blocker_count,
                           (SELECT MAX(happened_at) FROM entries WHERE project_id = projects.id) AS last_entry_at
                    FROM projects
+                   WHERE IFNULL(archived, 0)=0
                    ORDER BY id ASC"""
             )
         )
@@ -742,11 +902,13 @@ class Store:
             raise ValueError("Project not found")
         status = clean_required_text(status, "Status", max_length=MAX_TEXT_LENGTH)
         now = utcnow()
+        who = self.get_setting("user_email")
         self.conn.execute(
-            "UPDATE projects SET status=?, status_at=?, updated_at=? WHERE id=?",
-            (status, now, now, project_id),
+            "UPDATE projects SET status=?, status_at=?, updated_at=?, last_edited_by=? WHERE id=?",
+            (status, now, now, who, project_id),
         )
         self.conn.commit()
+        self.add_audit(project_id, "status", status[:120])
 
     def add_entry(
         self,
@@ -763,16 +925,21 @@ class Store:
         body = clean_required_text(body, "Entry text", max_length=MAX_TEXT_LENGTH)
         when = normalize_iso_datetime(happened_at or utcnow())
         now = utcnow()
+        actor = self.get_setting("user_email")
+        listed = (who or actor).strip()
         cur = self.conn.execute(
-            """INSERT INTO entries (project_id, kind, who, body, happened_at, created_at, resolved)
-               VALUES (?,?,?,?,?,?,0)""",
-            (project_id, kind, who.strip(), body, when, now),
+            """INSERT INTO entries (project_id, kind, who, body, happened_at, created_at, resolved, uid)
+               VALUES (?,?,?,?,?,?,0,?)""",
+            (project_id, kind, listed, body, when, now, new_uid()),
         )
         self.conn.execute(
-            "UPDATE projects SET updated_at=? WHERE id=?", (now, project_id)
+            "UPDATE projects SET updated_at=?, last_edited_by=? WHERE id=?",
+            (now, actor, project_id),
         )
         self.conn.commit()
-        return int(cur.lastrowid)
+        eid = int(cur.lastrowid)
+        self.add_audit(project_id, "log", f"{KIND_LABEL.get(kind, kind)}: {body[:80]}")
+        return eid
 
     def resolve_blocker(self, project_id: int, entry_id: int) -> None:
         row = self.conn.execute(
@@ -864,6 +1031,265 @@ class Store:
         )
         return projects, entries
 
+    def export_package(self) -> bytes:
+        self.require_profile()
+        prof = self.profile()
+        def rows(sql: str, args: tuple = ()) -> list[dict[str, Any]]:
+            return [{k: r[k] for k in r.keys()} for r in self.conn.execute(sql, args)]
+        payload = {
+            "format": "workcrm",
+            "schema": SCHEMA_VERSION,
+            "exported_at": utcnow(),
+            "from": prof,
+            "clients": rows("SELECT * FROM clients"),
+            "projects": rows("SELECT * FROM projects"),
+            "entries": rows("SELECT * FROM entries"),
+            "attachments": rows("SELECT * FROM attachments"),
+            "audit": rows("SELECT * FROM audit_log"),
+        }
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("data.json", json.dumps(payload, default=str))
+            root = self.files_root()
+            for att in payload["attachments"]:
+                stored = att.get("stored") or ""
+                path = root / stored
+                if stored and path.is_file():
+                    zf.write(path, f"files/{att.get('uid') or stored}")
+        return buf.getvalue()
+
+    def write_export(self, folder: str | Path | None = None) -> Path:
+        raw = folder if folder is not None else self.get_setting("export_dir")
+        dest = Path(raw).expanduser() if str(raw).strip() else default_export_dir()
+        dest = dest.resolve()
+        dest.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        path = dest / f"WorkCRM-update-{stamp}.workcrm"
+        n = 1
+        while path.exists():
+            n += 1
+            path = dest / f"WorkCRM-update-{stamp}-{n}.workcrm"
+        path.write_bytes(self.export_package())
+        self.set_setting("export_dir", str(dest))
+        return path
+
+    def launch_email(self, path: Path) -> str:
+        path = path.resolve()
+        if not path.is_file():
+            raise ValueError("Export file not found")
+        subj = "WorkCRM update"
+        if os.name == "nt":
+            file_js = json.dumps(str(path))
+            subj_js = json.dumps(subj)
+            script = (
+                f"$p = {file_js}; $s = {subj_js}; "
+                "try { $ol = New-Object -ComObject Outlook.Application; "
+                "$m = $ol.CreateItem(0); $m.Subject = $s; $m.Attachments.Add($p); $m.Display() } "
+                "catch { Start-Process ('mailto:?subject=' + [uri]::EscapeDataString($s)) }"
+            )
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                close_fds=True,
+            )
+            return "outlook"
+        xdg = shutil.which("xdg-email")
+        if xdg:
+            subprocess.Popen([xdg, "--attach", str(path), "--subject", subj], close_fds=True)
+            return "xdg-email"
+        webbrowser.open("mailto:?subject=" + quote(subj))
+        return "mailto"
+
+    def import_package(self, blob: bytes) -> dict[str, int]:
+        importer = self.require_profile()
+        buf = io.BytesIO(blob)
+        try:
+            zf = zipfile.ZipFile(buf)
+        except zipfile.BadZipFile as exc:
+            raise ValueError("Not a WorkCRM package") from exc
+        if "data.json" not in zf.namelist():
+            raise ValueError("Not a WorkCRM package")
+        data = json.loads(zf.read("data.json").decode("utf-8"))
+        if data.get("format") != "workcrm":
+            raise ValueError("Not a WorkCRM package")
+        added = updated = skipped = 0
+        client_map: dict[int, int] = {}
+        client_uid_map: dict[str, int] = {}
+
+        def newer(incoming: str, local: str) -> bool:
+            return (incoming or "") > (local or "")
+
+        for c in data.get("clients") or []:
+            uid = c.get("uid") or ""
+            if not uid:
+                skipped += 1
+                continue
+            local = self.conn.execute("SELECT * FROM clients WHERE uid=?", (uid,)).fetchone()
+            fields = {k: c.get(k, "") for k, _ in CLIENT_FIELDS if k != "name"}
+            if local is None:
+                cid = self.add_client(c.get("name") or "Imported client", **fields)
+                self.conn.execute(
+                    "UPDATE clients SET uid=?, created_by=?, last_edited_by=?, updated_at=? WHERE id=?",
+                    (uid, c.get("created_by") or "", c.get("last_edited_by") or "", c.get("updated_at") or utcnow(), cid),
+                )
+                added += 1
+                client_uid_map[uid] = cid
+                if c.get("id") is not None:
+                    client_map[int(c["id"])] = cid
+            else:
+                client_uid_map[uid] = int(local["id"])
+                if c.get("id") is not None:
+                    client_map[int(c["id"])] = int(local["id"])
+                if newer(c.get("updated_at") or "", local["updated_at"] or ""):
+                    self.update_client(int(local["id"]), c.get("name") or local["name"], **fields)
+                    self.conn.execute(
+                        "UPDATE clients SET last_edited_by=?, updated_at=? WHERE id=?",
+                        (c.get("last_edited_by") or importer, c.get("updated_at"), local["id"]),
+                    )
+                    updated += 1
+                else:
+                    skipped += 1
+
+        project_uid_map: dict[str, int] = {}
+        for p in data.get("projects") or []:
+            uid = p.get("uid") or ""
+            if not uid:
+                skipped += 1
+                continue
+            local = self.conn.execute("SELECT * FROM projects WHERE uid=?", (uid,)).fetchone()
+            cid = None
+            if p.get("client_id") and int(p["client_id"]) in client_map:
+                cid = client_map[int(p["client_id"])]
+            incoming_updated = p.get("updated_at") or ""
+            if local is None:
+                pid = self.add_project(
+                    p.get("name") or "Imported project",
+                    client=p.get("client") or "",
+                    lane=p.get("lane") or "Planning",
+                    health=p.get("health") or "not_started",
+                    priority=p.get("priority") or "medium",
+                    client_id=cid,
+                )
+                self.conn.execute(
+                    """UPDATE projects SET uid=?, created_by=?, last_edited_by=?, status=?, status_at=?,
+                       archived=?, updated_at=?, created_at=? WHERE id=?""",
+                    (
+                        uid,
+                        p.get("created_by") or "",
+                        p.get("last_edited_by") or "",
+                        p.get("status") or "",
+                        p.get("status_at") or "",
+                        int(p.get("archived") or 0),
+                        incoming_updated or utcnow(),
+                        p.get("created_at") or utcnow(),
+                        pid,
+                    ),
+                )
+                added += 1
+                project_uid_map[uid] = pid
+                self.add_audit(pid, "imported", f"From {data.get('from', {}).get('email', '')}", who=importer)
+            else:
+                pid = int(local["id"])
+                project_uid_map[uid] = pid
+                if newer(incoming_updated, local["updated_at"] or ""):
+                    self.update_project(
+                        pid,
+                        p.get("name") or local["name"],
+                        p.get("client") or local["client"],
+                        lane=p.get("lane"),
+                        health=p.get("health"),
+                        priority=p.get("priority"),
+                        client_id=cid if cid is not None else 0,
+                    )
+                    self.conn.execute(
+                        """UPDATE projects SET last_edited_by=?, status=?, status_at=?, archived=?, updated_at=?
+                           WHERE id=?""",
+                        (
+                            p.get("last_edited_by") or importer,
+                            p.get("status") or local["status"],
+                            p.get("status_at") or local["status_at"],
+                            int(p.get("archived") or 0),
+                            incoming_updated,
+                            pid,
+                        ),
+                    )
+                    updated += 1
+                    self.add_audit(pid, "imported", "Updated from package", who=importer)
+                else:
+                    skipped += 1
+
+        for ent in data.get("entries") or []:
+            uid = ent.get("uid") or ""
+            puid = ""
+            # map via project_id in package -> project uid
+            src_pid = ent.get("project_id")
+            local_pid = None
+            if src_pid is not None:
+                prow = next((x for x in data.get("projects") or [] if x.get("id") == src_pid), None)
+                if prow and prow.get("uid") in project_uid_map:
+                    local_pid = project_uid_map[prow["uid"]]
+            if not uid or local_pid is None:
+                continue
+            exists = self.conn.execute("SELECT id FROM entries WHERE uid=?", (uid,)).fetchone()
+            if exists:
+                skipped += 1
+                continue
+            self.conn.execute(
+                """INSERT INTO entries (project_id, kind, who, body, happened_at, created_at, resolved, uid)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    local_pid,
+                    ent.get("kind") or "note",
+                    ent.get("who") or "",
+                    ent.get("body") or "",
+                    ent.get("happened_at") or utcnow(),
+                    ent.get("created_at") or utcnow(),
+                    int(ent.get("resolved") or 0),
+                    uid,
+                ),
+            )
+            added += 1
+
+        root = self.files_root()
+        for att in data.get("attachments") or []:
+            uid = att.get("uid") or ""
+            src_pid = att.get("project_id")
+            local_pid = None
+            prow = next((x for x in data.get("projects") or [] if x.get("id") == src_pid), None)
+            if prow and prow.get("uid") in project_uid_map:
+                local_pid = project_uid_map[prow["uid"]]
+            if not uid or local_pid is None:
+                continue
+            if self.conn.execute("SELECT id FROM attachments WHERE uid=?", (uid,)).fetchone():
+                skipped += 1
+                continue
+            member = f"files/{uid}"
+            raw = b""
+            if member in zf.namelist():
+                raw = zf.read(member)
+            elif att.get("stored"):
+                alt = f"files/{att['stored']}"
+                if alt in zf.namelist():
+                    raw = zf.read(alt)
+            if not raw:
+                continue
+            name = att.get("name") or "file"
+            ext = Path(name).suffix.lower() or ".bin"
+            cur = self.conn.execute(
+                """INSERT INTO attachments (project_id, name, stored, mime, size, created_at, uid)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (local_pid, name, "", att.get("mime") or "", len(raw), att.get("created_at") or utcnow(), uid),
+            )
+            aid = int(cur.lastrowid)
+            stored = f"{local_pid}/{aid}{ext}"
+            dest = root / stored
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(raw)
+            self.conn.execute("UPDATE attachments SET stored=? WHERE id=?", (stored, aid))
+            added += 1
+
+        self.conn.commit()
+        return {"added": added, "updated": updated, "skipped": skipped}
+
 
 def e(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
@@ -945,23 +1371,24 @@ th { color:var(--muted); font-size:11px; font-weight:600; letter-spacing:.04em; 
 .ev { padding:10px 0; border-bottom:1px solid var(--line); }
 .ev .k { font-size:11px; color:var(--muted); }
 .status { white-space:pre-wrap; font-size:16px; line-height:1.55; margin:8px 0 0; }
-.group { margin:0 28px 28px; }
+.group { margin:0 28px 28px; overflow:visible; position:relative; }
 .group h2 { margin:0 0 12px; font-size:15px; font-weight:650; color:var(--ink); border:0; padding:0 0 0 14px; display:block; position:relative; }
 .group h2::before { content:""; position:absolute; left:0; top:4px; width:8px; height:8px; border-radius:99px; background:var(--muted); }
 .group.Planning h2::before { background:var(--plan); }
 .group.Execution h2::before { background:var(--exec); }
 .group.Launch h2::before { background:var(--lau); }
-.board { background:var(--panel); border:1px solid var(--line); overflow:auto; border-radius:12px;
+.board { background:var(--panel); border:1px solid var(--line); overflow:visible; border-radius:12px;
   box-shadow:0 1px 2px rgba(0,0,0,.04); }
 .board table { min-width:860px; }
 .board th, .board td { border-bottom:1px solid var(--line); vertical-align:middle; }
 .board th { padding:10px 12px; background:#faf9f7; }
 .th-wrap { display:flex; align-items:center; justify-content:space-between; gap:6px; }
-.colmenu { position:relative; }
+.colmenu { position:relative; z-index:2; }
 .colmenu summary { cursor:pointer; list-style:none; color:var(--muted); font-size:12px; padding:4px 6px; border-radius:6px; }
 .colmenu summary:hover { background:var(--hover); }
 .colmenu summary::-webkit-details-marker { display:none; }
-.colmenu .menu { position:absolute; right:0; top:120%; z-index:20; background:#fff;
+.colmenu[open] { z-index:80; }
+.colmenu .menu { position:absolute; right:0; top:calc(100% + 4px); z-index:80; background:#fff;
   border:1px solid var(--line); padding:12px; min-width:220px; border-radius:12px;
   box-shadow:0 8px 24px rgba(0,0,0,.10); }
 .colmenu .menu form { margin:8px 0 0; }
@@ -1027,8 +1454,12 @@ def page(title: str, body: str, nav: str = "projects") -> bytes:
     <div class="brand">Work<span>CRM</span></div>
     <nav>
       {item("/", "projects", "Projects")}
+      {item("/archived", "archived", "Archived")}
       {item("/clients", "clients", "Clients")}
       {item("/projects/new", "new", "New project")}
+      {item("/settings", "settings", "Profile")}
+      {item("/import", "import", "Import")}
+      {item("/export", "export", "Export")}
     </nav>
     <div class="grow"></div>
     <form method="get" action="/search">
@@ -1136,6 +1567,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, self._project(int(path.split("/")[2])))
             elif path == "/search":
                 self._send(200, self._search((qs.get("q") or [""])[0]))
+            elif path == "/archived":
+                self._send(200, self._archived())
             elif path == "/clients":
                 self._send(200, self._clients())
             elif path == "/clients/new":
@@ -1144,6 +1577,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, self._client_form(int(path.split("/")[2])))
             elif path.startswith("/clients/"):
                 self._send(200, self._client_record(int(path.split("/")[2])))
+            elif path == "/settings":
+                self._send(200, self._settings())
+            elif path == "/import":
+                self._send(200, self._import())
+            elif path == "/export/download":
+                blob = self.store.export_package()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(blob)))
+                self.send_header(
+                    "Content-Disposition", 'attachment; filename="WorkCRM-update.workcrm"'
+                )
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(blob)
+            elif path == "/export":
+                self._send(200, self._export())
             else:
                 self._send(404, page("Not found", self._bar("Not found") + '<div class="content"><p>Not found.</p></div>'))
         except (ValueError, IndexError):
@@ -1196,6 +1646,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.store.add_attachment(pid, name, data, mime)
                     self._redirect(f"/projects/{pid}")
                     return
+                if path == "/import":
+                    if "file" not in files:
+                        raise ValueError("Choose a WorkCRM package")
+                    _name, data, _mime = files["file"]
+                    summary = self.store.import_package(data)
+                    self._redirect(
+                        "/import?added=%s&updated=%s&skipped=%s"
+                        % (summary["added"], summary["updated"], summary["skipped"])
+                    )
+                    return
                 raise ValueError("Unexpected upload")
             except ValueError as err:
                 self._send(
@@ -1240,6 +1700,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/projects/") and path.endswith("/delete"):
                 pid = int(path.split("/")[2])
                 self.store.delete_project(pid)
+                self._redirect("/")
+            elif path.startswith("/projects/") and path.endswith("/unarchive"):
+                pid = int(path.split("/")[2])
+                self.store.set_archived(pid, False)
+                self._redirect("/archived")
+            elif path.startswith("/projects/") and path.endswith("/archive"):
+                pid = int(path.split("/")[2])
+                self.store.set_archived(pid, True)
                 self._redirect("/")
             elif path.startswith("/projects/") and "/blockers/" in path and path.endswith("/resolve"):
                 bits = path.split("/")
@@ -1305,6 +1773,28 @@ class Handler(BaseHTTPRequestHandler):
                     **{k: form.get(k, "") for k, _ in CLIENT_FIELDS if k != "name"},
                 )
                 self._redirect(f"/clients/{cid}")
+            elif path == "/settings":
+                self.store.set_profile(form.get("email", ""), form.get("name", ""))
+                folder = form.get("export_dir", "").strip()
+                self.store.set_setting("export_dir", folder)
+                self.store.set_setting(
+                    "email_after_export",
+                    "1" if form.get("email_after") else "0",
+                )
+                self._redirect("/settings")
+            elif path == "/export/save":
+                folder = form.get("export_dir", "").strip()
+                path = self.store.write_export(folder or None)
+                if self.store.get_setting("email_after_export") == "1" or form.get("email"):
+                    self.store.launch_email(path)
+                    self._redirect("/export?saved=" + quote(str(path)) + "&emailed=1")
+                else:
+                    self._redirect("/export?saved=" + quote(str(path)))
+            elif path == "/export/email":
+                folder = form.get("export_dir", "").strip()
+                path = self.store.write_export(folder or None)
+                self.store.launch_email(path)
+                self._redirect("/export?saved=" + quote(str(path)) + "&emailed=1")
             else:
                 self._send(404, page("Not found", self._bar("Not found") + '<div class="content"><p>Not found.</p></div>'))
         except ValueError as err:
@@ -1476,6 +1966,101 @@ class Handler(BaseHTTPRequestHandler):
         body = self._bar("Projects", extra) + toolbar + "".join(groups)
         return page("Projects", body, "projects")
 
+    def _archived(self) -> bytes:
+        rows = []
+        for p in self.store.list_archived():
+            rows.append(
+                f"<tr><td><a href='/projects/{p['id']}'>{e(p['name'])}</a></td>"
+                f"<td>{e(p['client']) or '—'}</td>"
+                f"<td>{e(p['lane'])}</td>"
+                f"<td>{e(HEALTH.get(p['health'], p['health']))}</td>"
+                f"<td>{e(short_when(p['updated_at']))}</td>"
+                f"<td><form method='post' action='/projects/{p['id']}/unarchive'>"
+                f"<button class='btn ghost' type='submit'>Restore</button></form></td></tr>"
+            )
+        table = (
+            "<table><tr><th>Project</th><th>Client</th><th>Group</th><th>Status</th><th>Archived</th><th></th></tr>"
+            + ("".join(rows) or "<tr><td colspan='6' class='muted'>Nothing archived yet.</td></tr>")
+            + "</table>"
+        )
+        body = (
+            self._bar("Archived")
+            + '<div class="content"><p class="muted">Off the board, still here. Open a row or restore it.</p>'
+            + table
+            + "</div>"
+        )
+        return page("Archived", body, "archived")
+
+    def _settings(self) -> bytes:
+        p = self.store.profile()
+        folder = self.store.get_setting("export_dir") or str(default_export_dir())
+        checked = " checked" if self.store.get_setting("email_after_export") == "1" else ""
+        form = f"""
+        <form class="stack" method="post" action="/settings">
+          <p class="muted">This email identifies you on exports, imports, and the audit log.
+          The other person should use a different email.</p>
+          <label>Your name <input name="name" required value="{e(p['name'])}"></label>
+          <label>Email <input name="email" type="email" required value="{e(p['email'])}"></label>
+          <label>Save exports in this folder
+            <input name="export_dir" value="{e(folder)}" placeholder="C:\\Users\\You\\Desktop"></label>
+          <p class="muted">Paste the full folder path (Desktop, a Google Drive folder, etc.).</p>
+          <label><input type="checkbox" name="email_after" value="1"{checked}>
+            After Export, open Outlook (or Mail) with the file attached</label>
+          <button type="submit">Save profile</button>
+        </form>"""
+        body = self._bar("Your profile") + f'<div class="content">{form}</div>'
+        return page("Profile", body, "settings")
+
+    def _import(self) -> bytes:
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        note = ""
+        if "added" in qs:
+            note = (
+                f'<p>Import finished. Added {e(qs["added"][0])}, '
+                f'updated {e((qs.get("updated") or ["0"])[0])}, '
+                f'skipped {e((qs.get("skipped") or ["0"])[0])} (already on this PC).</p>'
+            )
+        form = f"""
+        <div class="stack">
+          {note}
+          <p class="muted">Your existing projects stay. New or newer items from the file are added.
+          Set your profile first. Send <b>WorkCRM-update.workcrm</b> like the .exe — not GitHub.</p>
+          <form class="stack" method="post" action="/import" enctype="multipart/form-data">
+            <label>Package <input type="file" name="file" required accept=".workcrm,.zip"></label>
+            <button type="submit">Import (keep my work)</button>
+          </form>
+          <p><a href="/export">Export my copy</a> (downloads a package to send).</p>
+        </div>"""
+        body = self._bar("Import") + f'<div class="content">{form}</div>'
+        return page("Import", body, "import")
+
+    def _export(self) -> bytes:
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        folder = self.store.get_setting("export_dir") or str(default_export_dir())
+        note = ""
+        if qs.get("saved"):
+            note = f'<p>Saved to <b>{e(qs["saved"][0])}</b></p>'
+        if qs.get("emailed"):
+            note += "<p>Tried to open Outlook (or your mail app) with that file attached. If nothing opened, attach the file yourself from that folder. Gmail in a browser cannot auto-attach a local file.</p>"
+        form = f"""
+        <div class="stack">
+          {note}
+          <p class="muted">Set your <a href="/settings">profile</a> first. Choose the folder below (Desktop or your Google Drive folder is fine).</p>
+          <form class="stack" method="post" action="/export/save">
+            <label>Save in this folder <input name="export_dir" value="{e(folder)}"></label>
+            <button type="submit">Save export here</button>
+          </form>
+          <form class="stack" method="post" action="/export/email">
+            <input type="hidden" name="export_dir" value="{e(folder)}">
+            <button type="submit">Save and open email with file attached</button>
+          </form>
+          <p><a href="/export/download">Or download in the browser</a> (browser Save As).</p>
+        </div>"""
+        body = self._bar("Export") + f'<div class="content">{form}</div>'
+        return page("Export", body, "export")
+
     def _clients(self) -> bytes:
         rows = []
         for c in self.store.list_clients():
@@ -1599,7 +2184,20 @@ class Handler(BaseHTTPRequestHandler):
         extra = (
             f'<a class="btn ghost" href="/projects/{project_id}/edit">Edit</a>'
             f'<a class="btn" href="/projects/{project_id}/report">Status report</a>'
-            f'<form method="post" action="/projects/{project_id}/delete" style="display:inline">'
+        )
+        if int(p["archived"] or 0):
+            extra += (
+                f'<form method="post" action="/projects/{project_id}/unarchive" style="display:inline">'
+                f'<button class="btn ghost" type="submit">Restore to board</button></form>'
+            )
+        else:
+            extra += (
+                f'<form method="post" action="/projects/{project_id}/archive" style="display:inline">'
+                f'<button class="btn ghost" type="submit">Archive</button></form>'
+            )
+        extra += (
+            f'<form method="post" action="/projects/{project_id}/delete" style="display:inline"'
+            f' onsubmit="return confirm(\'Delete this project permanently?\')">'
             f'<button class="btn ghost" type="submit">Delete project</button></form>'
         )
         block_html = ""
@@ -1637,9 +2235,31 @@ class Handler(BaseHTTPRequestHandler):
               </form>
               <div class="files">{"".join(items) or '<p class="faint">No files yet.</p>'}</div>
             </div>"""
+        created = p["created_by"] if "created_by" in p.keys() else ""
+        edited = p["last_edited_by"] if "last_edited_by" in p.keys() else ""
+        byline = ""
+        if created or edited:
+            byline = (
+                f'<p class="muted">Created by {e(created or "—")}'
+                f' · Last edited by {e(edited or "—")}</p>'
+            )
+        audit_rows = []
+        for a in self.store.list_audit(project_id):
+            audit_rows.append(
+                f"<tr><td>{e(short_when(a['created_at']))}</td>"
+                f"<td>{e(a['who'])}</td><td>{e(a['action'])}</td>"
+                f"<td>{e(a['detail'])}</td></tr>"
+            )
+        audit_html = (
+            '<div class="box" style="margin-top:16px"><h2>Audit log</h2>'
+            "<table><tr><th>When</th><th>Who</th><th>What</th><th>Detail</th></tr>"
+            + ("".join(audit_rows) or "<tr><td colspan='4' class='muted'>No history yet.</td></tr>")
+            + "</table></div>"
+        )
         body = self._bar(p["name"], extra) + f"""
         <div class="content">
           {f'<p class="muted">For <a href="/clients/{p["client_id"]}">{e(p["client"])}</a></p>' if p["client_id"] else (f'<p class="muted">For {e(p["client"])}</p>' if p["client"] else '')}
+          {byline}
           {block_html}
           {files_html}
           <div class="record">
@@ -1669,6 +2289,7 @@ class Handler(BaseHTTPRequestHandler):
               {timeline}
             </div>
           </div>
+          {audit_html}
         </div>"""
         return page(p["name"], body, "projects")
 
