@@ -1,0 +1,10 @@
+.git
+__pycache__
+*.pyc
+*.db
+files/
+.venv
+dist
+build
+*.spec
+How-to-use-WorkCRM.pdf
