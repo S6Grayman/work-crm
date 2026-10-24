@@ -10,7 +10,7 @@ No cloud. No account. Work stays on **your** computer.
 
 This is not a website. You run it on your PC, then open http://127.0.0.1:8765
 
-**Windows (easiest):** download **WorkCRM.exe** from [Releases](https://github.com/S6Grayman/work-crm/releases). Double-click it. Leave the window open while you work; close it to quit. Windows may warn the first time (the file is new and unsigned) — **More info → Run anyway**.
+**Windows (easiest):** download **WorkCRM.exe** from [Releases](https://github.com/S6Grayman/work-crm/releases). Double-click it — a browser opens, no extra black window. Use **Quit** in the sidebar when you are done (closing the tab does not stop the app). Windows may warn the first time (the file is new and unsigned) — **More info → Run anyway**.
 
 **Python 3.11+** (Windows or Linux), from this folder:
 

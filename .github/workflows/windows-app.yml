@@ -20,7 +20,7 @@ jobs:
       - name: Install PyInstaller
         run: python -m pip install --disable-pip-version-check pyinstaller
       - name: Build WorkCRM.exe
-        run: python -m PyInstaller --noconfirm --clean --onefile --console --name WorkCRM crm.py
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --icon assets/workcrm.ico --name WorkCRM crm.py
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:

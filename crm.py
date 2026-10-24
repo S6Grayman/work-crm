@@ -1327,6 +1327,8 @@ nav a.on { background:rgba(255,255,255,.14); color:#fff; }
 .grow { flex:1; }
 aside form input { width:100%; background:rgba(0,0,0,.25); color:#fff; border:1px solid rgba(255,255,255,.16); border-radius:8px; }
 aside form input::placeholder { color:#c9b3d4; }
+aside .quit { width:100%; margin-top:8px; background:transparent; color:var(--side-dim);
+  border:1px solid rgba(255,255,255,.16); }
 .top { display:flex; align-items:center; gap:12px; padding:22px 28px 8px; }
 h1 { margin:0; font-size:22px; }
 .sp { flex:1; }
@@ -1465,6 +1467,9 @@ def page(title: str, body: str, nav: str = "projects") -> bytes:
     <form method="get" action="/search">
       <input name="q" placeholder="Search" aria-label="Search">
     </form>
+    <form method="post" action="/quit">
+      <button class="quit" type="submit">Quit</button>
+    </form>
   </aside>
   <main>{body}</main>
 </div>
@@ -1505,6 +1510,7 @@ def pill(kind: str) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     store: Store
+    httpd: HTTPServer | None = None
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -1795,6 +1801,16 @@ class Handler(BaseHTTPRequestHandler):
                 path = self.store.write_export(folder or None)
                 self.store.launch_email(path)
                 self._redirect("/export?saved=" + quote(str(path)) + "&emailed=1")
+            elif path == "/quit":
+                server = getattr(type(self), "httpd", None)
+                if server is not None:
+                    threading.Thread(target=server.shutdown, daemon=True).start()
+                body = page(
+                    "Quit",
+                    self._bar("Stopped")
+                    + '<div class="content"><p>WorkCRM has stopped. You can close this tab.</p></div>',
+                )
+                self._send(200, body)
             else:
                 self._send(404, page("Not found", self._bar("Not found") + '<div class="content"><p>Not found.</p></div>'))
         except ValueError as err:
@@ -2373,6 +2389,7 @@ def make_handler(store: Store) -> type[Handler]:
         pass
 
     Bound.store = store
+    Bound.httpd = None
     Bound.protocol_version = "HTTP/1.1"
     return Bound
 
@@ -2393,6 +2410,7 @@ def main(argv: list[str] | None = None) -> int:
     store = Store(args.db)
     handler = make_handler(store)
     httpd = HTTPServer((args.host, args.port), handler)
+    handler.httpd = httpd
     url = f"http://{args.host}:{args.port}"
     print(f"WorkCRM  {url}  db={args.db}", flush=True)
     if args.open:
